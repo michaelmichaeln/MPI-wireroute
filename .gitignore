@@ -1,0 +1,5 @@
+# Only wireroute.cpp and wireroute.h are tracked for this repo
+*
+!wireroute.cpp
+!wireroute.h
+!.gitignore
