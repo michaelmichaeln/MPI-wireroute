@@ -1,6 +1,6 @@
 /**
  * Parallel VLSI Wire Routing via MPI
- * Assignment 4: Pure across-wires, symmetric peer-to-peer. hi buddy
+ * Assignment 4: Pure across-wires, symmetric peer-to-peer. hi
  */
 
 #include "wireroute.h"
