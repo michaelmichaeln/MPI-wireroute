@@ -1,6 +1,6 @@
 /**
  * Parallel VLSI Wire Routing via MPI
- * Assignment 4: Pure across-wires, symmetric peer-to-peer. hi
+ * Assignment 4: Pure across-wires, symmetric peer-to-peer.
  */
 
 #include "wireroute.h"
@@ -20,25 +20,22 @@
 #include <mpi.h>
 #include <unistd.h>
 
-void print_stats(const std::vector<std::vector<int>> &occupancy) {
+static constexpr int MAX_U_SAMPLES = 256;
+
+void print_stats(const int *occ, int n) {
   int max_occupancy = 0;
   long long total_cost = 0;
-
-  for (const auto &row : occupancy) {
-    for (const int count : row) {
-      max_occupancy = std::max(max_occupancy, count);
-      total_cost += count * count;
-    }
+  for (int i = 0; i < n; i++) {
+    max_occupancy = std::max(max_occupancy, occ[i]);
+    total_cost += (long long)occ[i] * occ[i];
   }
-
   std::cout << "Max occupancy: " << max_occupancy << '\n';
   std::cout << "Total cost: " << total_cost << '\n';
 }
 
 void write_output(
     const std::vector<Wire> &wires, const int num_wires,
-    const std::vector<std::vector<int>> &occupancy, const int dim_x,
-    const int dim_y,
+    const int *occ, const int dim_x, const int dim_y,
     std::string wires_output_file_path,
     std::string occupancy_output_file_path) {
 
@@ -48,10 +45,11 @@ void write_output(
     exit(EXIT_FAILURE);
   }
   out_occupancy << dim_x << ' ' << dim_y << '\n';
-
-  for (const auto &row : occupancy) {
-    for (size_t i = 0; i < row.size(); ++i)
-      out_occupancy << row[i] << (i == row.size() - 1 ? "" : " ");
+  for (int y = 0; y < dim_y; y++) {
+    for (int x = 0; x < dim_x; x++) {
+      out_occupancy << occ[y * dim_x + x];
+      if (x < dim_x - 1) out_occupancy << ' ';
+    }
     out_occupancy << '\n';
   }
   out_occupancy.close();
@@ -69,18 +67,15 @@ void write_output(
     validate_wire_t keypoints = wire.to_validate_format();
     for (int i = 0; i < keypoints.num_pts; ++i) {
       out_wires << keypoints.p[i].x << ' ' << keypoints.p[i].y;
-      if (i < keypoints.num_pts - 1)
-        out_wires << ' ';
+      if (i < keypoints.num_pts - 1) out_wires << ' ';
     }
     out_wires << '\n';
   }
-
   out_wires.close();
 }
 
-// --- Occupancy and cost (no atomics; private memory per rank) ---
-void update_occupancy(std::vector<std::vector<int>> &occupancy,
-                     const Wire &wire, int delta) {
+inline void update_occupancy(int *occ, int dim_x,
+                             const Wire &wire, int delta) {
   int num_pts = 2 + wire.num_bends;
   int px[MAX_PTS_PER_WIRE], py[MAX_PTS_PER_WIRE];
   px[0] = wire.start_x; py[0] = wire.start_y;
@@ -97,17 +92,16 @@ void update_occupancy(std::vector<std::vector<int>> &occupancy,
     int dx = (x_end > x) ? 1 : (x_end < x) ? -1 : 0;
     int dy = (y_end > y) ? 1 : (y_end < y) ? -1 : 0;
     while (x != x_end || y != y_end) {
-      occupancy[y][x] += delta;
+      occ[y * dim_x + x] += delta;
       x += dx; y += dy;
     }
     if (seg == num_pts - 2) {
-      occupancy[y][x] += delta;
+      occ[y * dim_x + x] += delta;
     }
   }
 }
 
-int path_cost_direct(const std::vector<std::vector<int>> &occupancy,
-                     const Wire &wire) {
+inline int path_cost_direct(const int *occ, int dim_x, const Wire &wire) {
   int cost = 0;
   int num_pts = 2 + wire.num_bends;
   int px[MAX_PTS_PER_WIRE], py[MAX_PTS_PER_WIRE];
@@ -125,70 +119,12 @@ int path_cost_direct(const std::vector<std::vector<int>> &occupancy,
     int dx = (x_end > x) ? 1 : (x_end < x) ? -1 : 0;
     int dy = (y_end > y) ? 1 : (y_end < y) ? -1 : 0;
     while (x != x_end || y != y_end) {
-      int v = occupancy[y][x];
+      int v = occ[y * dim_x + x];
       cost += v * v;
       x += dx; y += dy;
     }
     if (seg == num_pts - 2) {
-      cost += occupancy[y][x] * occupancy[y][x];
-    }
-  }
-  return cost;
-}
-
-void mask_wire_cells(const Wire &wire, std::vector<uint8_t> &mask, int dim_x,
-                     uint8_t val) {
-  int num_pts = 2 + wire.num_bends;
-  int px[MAX_PTS_PER_WIRE], py[MAX_PTS_PER_WIRE];
-  px[0] = wire.start_x; py[0] = wire.start_y;
-  for (int i = 0; i < wire.num_bends; i++) {
-    px[1 + i] = wire.bend_x[i];
-    py[1 + i] = wire.bend_y[i];
-  }
-  px[num_pts - 1] = wire.end_x;
-  py[num_pts - 1] = wire.end_y;
-
-  for (int seg = 0; seg < num_pts - 1; seg++) {
-    int x = px[seg], y = py[seg];
-    int x_end = px[seg + 1], y_end = py[seg + 1];
-    int dx = (x_end > x) ? 1 : (x_end < x) ? -1 : 0;
-    int dy = (y_end > y) ? 1 : (y_end < y) ? -1 : 0;
-    while (x != x_end || y != y_end) {
-      mask[y * dim_x + x] = val;
-      x += dx; y += dy;
-    }
-    if (seg == num_pts - 2) {
-      mask[y * dim_x + x] = val;
-    }
-  }
-}
-
-int path_cost_masked(const std::vector<std::vector<int>> &occupancy,
-                     const Wire &wire,
-                     const std::vector<uint8_t> &mask, int dim_x) {
-  int cost = 0;
-  int num_pts = 2 + wire.num_bends;
-  int px[MAX_PTS_PER_WIRE], py[MAX_PTS_PER_WIRE];
-  px[0] = wire.start_x; py[0] = wire.start_y;
-  for (int i = 0; i < wire.num_bends; i++) {
-    px[1 + i] = wire.bend_x[i];
-    py[1 + i] = wire.bend_y[i];
-  }
-  px[num_pts - 1] = wire.end_x;
-  py[num_pts - 1] = wire.end_y;
-
-  for (int seg = 0; seg < num_pts - 1; seg++) {
-    int x = px[seg], y = py[seg];
-    int x_end = px[seg + 1], y_end = py[seg + 1];
-    int dx = (x_end > x) ? 1 : (x_end < x) ? -1 : 0;
-    int dy = (y_end > y) ? 1 : (y_end < y) ? -1 : 0;
-    while (x != x_end || y != y_end) {
-      int v = occupancy[y][x] - mask[y * dim_x + x];
-      cost += v * v;
-      x += dx; y += dy;
-    }
-    if (seg == num_pts - 2) {
-      int v = occupancy[y][x] - mask[y * dim_x + x];
+      int v = occ[y * dim_x + x];
       cost += v * v;
     }
   }
@@ -257,7 +193,6 @@ Wire build_route(const Wire &wire, int route_index) {
   return w;
 }
 
-// --- RouteUpdate: convert Wire to RouteUpdate for wire_id ---
 RouteUpdate wire_to_update(int wire_id, const Wire &w) {
   RouteUpdate u;
   u.wire_id = wire_id;
@@ -287,63 +222,58 @@ Wire update_to_wire(const RouteUpdate &u) {
   return w;
 }
 
-void apply_route_updates(std::vector<std::vector<int>> &occupancy,
+void apply_route_updates(int *occ, int dim_x,
                          std::vector<Wire> &wires,
                          const std::vector<RouteUpdate> &updates) {
   for (const RouteUpdate &u : updates) {
     int wi = u.wire_id;
     if (wi < 0 || wi >= static_cast<int>(wires.size())) continue;
-    Wire old_wire = wires[wi];
-    update_occupancy(occupancy, old_wire, -1);
+    update_occupancy(occ, dim_x, wires[wi], -1);
     wires[wi] = update_to_wire(u);
-    update_occupancy(occupancy, wires[wi], +1);
+    update_occupancy(occ, dim_x, wires[wi], +1);
   }
 }
 
-// --- Ring exchange: forward one bucket per shift (P-1 shifts), no accumulation ---
-// Pack: [int origin_rank][int count][RouteUpdate data]
-void exchange_updates(std::vector<std::vector<int>> &occupancy,
+void exchange_updates(int *occ, int dim_x,
                       std::vector<Wire> &wires,
                       const std::vector<RouteUpdate> &my_updates,
-                      int dim_x, int dim_y, int rank, int nproc, int tag,
+                      int max_count, int rank, int nproc, int tag,
                       std::vector<char> &send_buf,
                       std::vector<char> &recv_buf) {
-  const int max_count = dim_x * dim_y * 2;
   const int max_bytes = static_cast<int>(2 * sizeof(int)) +
                         max_count * static_cast<int>(sizeof(RouteUpdate));
 
-  auto pack_bucket = [&](int origin_rank, const std::vector<RouteUpdate> &updates)
-                         -> int {
+  auto pack_bucket = [&](int origin_rank,
+                         const std::vector<RouteUpdate> &updates) -> int {
     int count = static_cast<int>(updates.size());
     if (count > max_count) {
-      std::cerr << "Rank " << rank << ": too many route updates in one bucket ("
+      std::cerr << "Rank " << rank << ": too many route updates ("
                 << count << " > " << max_count << ")\n";
       MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
     }
     std::memcpy(send_buf.data(), &origin_rank, sizeof(int));
     std::memcpy(send_buf.data() + sizeof(int), &count, sizeof(int));
-    if (count > 0) {
+    if (count > 0)
       std::memcpy(send_buf.data() + 2 * sizeof(int), updates.data(),
                   count * sizeof(RouteUpdate));
-    }
     return static_cast<int>(2 * sizeof(int)) +
            count * static_cast<int>(sizeof(RouteUpdate));
   };
 
-  auto unpack_bucket = [&](std::vector<RouteUpdate> &updates, int &origin_rank) {
+  auto unpack_bucket = [&](std::vector<RouteUpdate> &updates,
+                           int &origin_rank) {
     int count = 0;
     std::memcpy(&origin_rank, recv_buf.data(), sizeof(int));
     std::memcpy(&count, recv_buf.data() + sizeof(int), sizeof(int));
     if (count < 0 || count > max_count) {
-      std::cerr << "Rank " << rank << ": invalid received update count " << count
+      std::cerr << "Rank " << rank << ": invalid received count " << count
                 << '\n';
       MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
     }
     updates.resize(count);
-    if (count > 0) {
+    if (count > 0)
       std::memcpy(updates.data(), recv_buf.data() + 2 * sizeof(int),
                   count * sizeof(RouteUpdate));
-    }
   };
 
   const int prev = (rank - 1 + nproc) % nproc;
@@ -358,15 +288,13 @@ void exchange_updates(std::vector<std::vector<int>> &occupancy,
     int send_size = pack_bucket(curr_origin, curr_updates);
 
     MPI_Request reqs[2];
-    MPI_Irecv(recv_buf.data(), max_bytes, MPI_BYTE, prev, tag, MPI_COMM_WORLD,
-              &reqs[0]);
-    MPI_Isend(send_buf.data(), send_size, MPI_BYTE, next, tag, MPI_COMM_WORLD,
-              &reqs[1]);
+    MPI_Irecv(recv_buf.data(), max_bytes, MPI_BYTE, prev, tag,
+              MPI_COMM_WORLD, &reqs[0]);
+    MPI_Isend(send_buf.data(), send_size, MPI_BYTE, next, tag,
+              MPI_COMM_WORLD, &reqs[1]);
 
-    // Apply remote bucket while this shift's communication is in flight.
-    if (curr_origin != rank) {
-      apply_route_updates(occupancy, wires, curr_updates);
-    }
+    if (curr_origin != rank)
+      apply_route_updates(occ, dim_x, wires, curr_updates);
 
     MPI_Waitall(2, reqs, MPI_STATUSES_IGNORE);
     unpack_bucket(next_updates, next_origin);
@@ -375,9 +303,8 @@ void exchange_updates(std::vector<std::vector<int>> &occupancy,
     curr_origin = next_origin;
   }
 
-  if (curr_origin != rank) {
-    apply_route_updates(occupancy, wires, curr_updates);
-  }
+  if (curr_origin != rank)
+    apply_route_updates(occ, dim_x, wires, curr_updates);
 }
 
 int main(int argc, char *argv[]) {
@@ -420,18 +347,21 @@ int main(int argc, char *argv[]) {
       default:
         if (rank == 0) {
           std::cerr << "Usage: " << argv[0]
-                    << " -f input_filename -n num_procs [-p SA_prob] [-i SA_iters] -m parallel_mode -b batch_size\n";
+                    << " -f input_filename -n num_procs [-p SA_prob] "
+                       "[-i SA_iters] -m parallel_mode -b batch_size\n";
         }
         MPI_Finalize();
         exit(EXIT_FAILURE);
     }
   }
 
-  if (input_filename.empty() || n_flag <= 0 || SA_iters <= 0 || batch_size <= 0 ||
+  if (input_filename.empty() || n_flag <= 0 || SA_iters <= 0 ||
+      batch_size <= 0 ||
       (parallel_mode != 'A' && parallel_mode != 'W')) {
     if (rank == 0) {
       std::cerr << "Usage: " << argv[0]
-                << " -f input_filename -n num_procs [-p SA_prob] [-i SA_iters] -m parallel_mode -b batch_size\n";
+                << " -f input_filename -n num_procs [-p SA_prob] "
+                   "[-i SA_iters] -m parallel_mode -b batch_size\n";
     }
     MPI_Finalize();
     exit(EXIT_FAILURE);
@@ -439,7 +369,8 @@ int main(int argc, char *argv[]) {
 
   if (n_flag != nproc) {
     if (rank == 0) {
-      std::cerr << "Error: -n " << n_flag << " must match number of MPI processes " << nproc << "\n";
+      std::cerr << "Error: -n " << n_flag
+                << " must match number of MPI processes " << nproc << "\n";
     }
     MPI_Finalize();
     exit(EXIT_FAILURE);
@@ -447,7 +378,8 @@ int main(int argc, char *argv[]) {
 
   if (parallel_mode != 'A') {
     if (rank == 0) {
-      std::cerr << "This implementation supports only across-wires mode (-m A).\n";
+      std::cerr << "This implementation supports only "
+                   "across-wires mode (-m A).\n";
     }
     MPI_Finalize();
     exit(EXIT_FAILURE);
@@ -455,7 +387,8 @@ int main(int argc, char *argv[]) {
 
   if (rank == 0) {
     std::cout << "Number of processes: " << nproc << '\n';
-    std::cout << "Simulated annealing probability parameter: " << SA_prob << '\n';
+    std::cout << "Simulated annealing probability parameter: " << SA_prob
+              << '\n';
     std::cout << "Simulated annealing iterations: " << SA_iters << '\n';
     std::cout << "Input file: " << input_filename << '\n';
     std::cout << "Parallel mode: " << parallel_mode << '\n';
@@ -464,12 +397,12 @@ int main(int argc, char *argv[]) {
 
   int dim_x, dim_y, num_wires;
   std::vector<Wire> wires;
-  std::vector<std::vector<int>> occupancy;
 
   {
     std::ifstream fin(input_filename);
     if (!fin) {
-      std::cerr << "Rank " << rank << ": unable to open " << input_filename << '\n';
+      std::cerr << "Rank " << rank << ": unable to open " << input_filename
+                << '\n';
       MPI_Finalize();
       exit(EXIT_FAILURE);
     }
@@ -487,38 +420,46 @@ int main(int argc, char *argv[]) {
     }
   }
 
-  occupancy.assign(dim_y, std::vector<int>(dim_x, 0));
-  for (const auto &wire : wires) {
-    update_occupancy(occupancy, wire, +1);
-  }
+  std::vector<int> occupancy(dim_y * dim_x, 0);
+  int *occ = occupancy.data();
+
+  for (const auto &wire : wires)
+    update_occupancy(occ, dim_x, wire, +1);
 
   if (rank == 0) {
-    const double init_time = std::chrono::duration_cast<std::chrono::duration<double>>(
-        std::chrono::steady_clock::now() - init_start).count();
-    std::cout << "Initialization time (sec): " << std::fixed << std::setprecision(10) << init_time << '\n';
+    const double init_time =
+        std::chrono::duration_cast<std::chrono::duration<double>>(
+            std::chrono::steady_clock::now() - init_start)
+            .count();
+    std::cout << "Initialization time (sec): " << std::fixed
+              << std::setprecision(10) << init_time << '\n';
   }
 
   const auto compute_start = std::chrono::steady_clock::now();
 
-  std::vector<uint8_t> cell_mask(dim_y * dim_x, 0);
   std::mt19937 rng(42 + rank);
   std::uniform_real_distribution<double> prob_dist(0.0, 1.0);
 
-  const int max_updates_per_peer = dim_x * dim_y * 2;
+  const int effective_batch = (nproc == 1) ? num_wires : batch_size;
+  const int max_updates_per_peer = std::max(1, effective_batch);
   const size_t max_exchange_bytes =
       2 * sizeof(int) + max_updates_per_peer * sizeof(RouteUpdate);
-  std::vector<char> ring_send_buf(max_exchange_bytes);
-  std::vector<char> ring_recv_buf(max_exchange_bytes);
-  // batch_size is interpreted as per-rank work per batch step.
+  std::vector<char> ring_send_buf;
+  std::vector<char> ring_recv_buf;
+  if (nproc > 1) {
+    ring_send_buf.resize(max_exchange_bytes);
+    ring_recv_buf.resize(max_exchange_bytes);
+  }
+
   const int num_batches =
-      (num_wires + (batch_size * nproc) - 1) / (batch_size * nproc);
+      (num_wires + (effective_batch * nproc) - 1) / (effective_batch * nproc);
 
   for (int iter = 0; iter < SA_iters; iter++) {
     for (int batch_idx = 0; batch_idx < num_batches; batch_idx++) {
       std::vector<RouteUpdate> my_updates;
 
-      const int local_start = batch_idx * batch_size;
-      const int local_end = local_start + batch_size;
+      const int local_start = batch_idx * effective_batch;
+      const int local_end = local_start + effective_batch;
       for (int local_i = local_start; local_i < local_end; local_i++) {
         int wi = rank + local_i * nproc;
         if (wi >= num_wires) break;
@@ -528,60 +469,92 @@ int main(int argc, char *argv[]) {
         int abs_dy = std::abs(wire.end_y - wire.start_y);
         if (abs_dx == 0 || abs_dy == 0) continue;
 
-        int total_routes = abs_dx + abs_dy + 2 * (abs_dx - 1) * (abs_dy - 1);
+        int l_routes = abs_dx + abs_dy;
+        int u_routes = 2 * (abs_dx - 1) * (abs_dy - 1);
+        int total_routes = l_routes + u_routes;
 
         if (prob_dist(rng) < SA_prob) {
           std::uniform_int_distribution<int> route_dist(0, total_routes - 1);
           Wire new_wire = build_route(wire, route_dist(rng));
-          update_occupancy(occupancy, wire, -1);
+          update_occupancy(occ, dim_x, wire, -1);
           wire = new_wire;
-          update_occupancy(occupancy, wire, +1);
+          update_occupancy(occ, dim_x, wire, +1);
           my_updates.push_back(wire_to_update(wi, wire));
           continue;
         }
 
-        mask_wire_cells(wire, cell_mask, dim_x, 1);
-        int best_cost = path_cost_masked(occupancy, wire, cell_mask, dim_x);
+        update_occupancy(occ, dim_x, wire, -1);
+        int best_cost = path_cost_direct(occ, dim_x, wire);
         int best_idx = -1;
 
-        for (int r = 0; r < total_routes; r++) {
+        for (int r = 0; r < l_routes; r++) {
           Wire candidate = build_route(wire, r);
-          int cost = path_cost_masked(occupancy, candidate, cell_mask, dim_x);
+          int cost = path_cost_direct(occ, dim_x, candidate);
           if (cost < best_cost) {
             best_cost = cost;
             best_idx = r;
           }
         }
-        mask_wire_cells(wire, cell_mask, dim_x, 0);
+
+        if (u_routes <= MAX_U_SAMPLES) {
+          for (int r = l_routes; r < total_routes; r++) {
+            Wire candidate = build_route(wire, r);
+            int cost = path_cost_direct(occ, dim_x, candidate);
+            if (cost < best_cost) {
+              best_cost = cost;
+              best_idx = r;
+            }
+          }
+        } else {
+          std::uniform_int_distribution<int> u_dist(l_routes,
+                                                    total_routes - 1);
+          for (int s = 0; s < MAX_U_SAMPLES; s++) {
+            int r = u_dist(rng);
+            Wire candidate = build_route(wire, r);
+            int cost = path_cost_direct(occ, dim_x, candidate);
+            if (cost < best_cost) {
+              best_cost = cost;
+              best_idx = r;
+            }
+          }
+        }
 
         if (best_idx >= 0) {
-          Wire new_wire = build_route(wire, best_idx);
-          update_occupancy(occupancy, wire, -1);
-          wire = new_wire;
-          update_occupancy(occupancy, wire, +1);
+          wire = build_route(wire, best_idx);
           my_updates.push_back(wire_to_update(wi, wire));
         }
+        update_occupancy(occ, dim_x, wire, +1);
       }
 
-      const int tag = (iter * num_batches + batch_idx) % 32768;
-      exchange_updates(occupancy, wires, my_updates, dim_x, dim_y, rank, nproc,
-                       tag, ring_send_buf, ring_recv_buf);
+      if (nproc > 1) {
+        const int tag = (iter * num_batches + batch_idx) % 32768;
+        exchange_updates(occ, dim_x, wires, my_updates, max_updates_per_peer,
+                         rank, nproc, tag, ring_send_buf, ring_recv_buf);
+      }
     }
   }
 
   MPI_Barrier(MPI_COMM_WORLD);
 
   if (rank == 0) {
-    const double compute_time = std::chrono::duration_cast<std::chrono::duration<double>>(
-        std::chrono::steady_clock::now() - compute_start).count();
-    std::cout << "Computation time (sec): " << std::fixed << std::setprecision(10) << compute_time << '\n';
+    const double compute_time =
+        std::chrono::duration_cast<std::chrono::duration<double>>(
+            std::chrono::steady_clock::now() - compute_start)
+            .count();
+    std::cout << "Computation time (sec): " << std::fixed
+              << std::setprecision(10) << compute_time << '\n';
   }
 
   if (rank == 0) {
-    wr_checker checker(wires, occupancy);
+    std::vector<std::vector<int>> occ_2d(dim_y, std::vector<int>(dim_x));
+    for (int y = 0; y < dim_y; y++)
+      for (int x = 0; x < dim_x; x++)
+        occ_2d[y][x] = occ[y * dim_x + x];
+
+    wr_checker checker(wires, occ_2d);
     checker.validate();
-    print_stats(occupancy);
-    write_output(wires, num_wires, occupancy, dim_x, dim_y,
+    print_stats(occ, dim_x * dim_y);
+    write_output(wires, num_wires, occ, dim_x, dim_y,
                  "outputs/wire_output.txt", "outputs/occ_output.txt");
   }
 

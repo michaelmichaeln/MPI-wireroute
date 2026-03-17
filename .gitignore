@@ -4,3 +4,4 @@
 !wireroute.h
 !.gitignore
 !.run_wires.sh
+!.run_wires_bench.sh
