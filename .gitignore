@@ -5,3 +5,5 @@
 !.gitignore
 !.run_wires.sh
 !.run_wires_bench.sh
+!.profile_hotloops.sh
+!.benchmark_report.py

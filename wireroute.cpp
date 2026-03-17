@@ -13,14 +13,13 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <numeric>
 #include <random>
 #include <string>
 #include <vector>
 
 #include <mpi.h>
 #include <unistd.h>
-
-static constexpr int MAX_U_SAMPLES = 256;
 
 void print_stats(const int *occ, int n) {
   int max_occupancy = 0;
@@ -89,16 +88,24 @@ inline void update_occupancy(int *occ, int dim_x,
   for (int seg = 0; seg < num_pts - 1; seg++) {
     int x = px[seg], y = py[seg];
     int x_end = px[seg + 1], y_end = py[seg + 1];
-    int dx = (x_end > x) ? 1 : (x_end < x) ? -1 : 0;
-    int dy = (y_end > y) ? 1 : (y_end < y) ? -1 : 0;
-    while (x != x_end || y != y_end) {
-      occ[y * dim_x + x] += delta;
-      x += dx; y += dy;
-    }
-    if (seg == num_pts - 2) {
-      occ[y * dim_x + x] += delta;
+    if (y == y_end) {
+      int *row = occ + y * dim_x;
+      if (x < x_end) {
+        for (int xi = x; xi < x_end; xi++) row[xi] += delta;
+      } else {
+        for (int xi = x; xi > x_end; xi--) row[xi] += delta;
+      }
+    } else {
+      if (y < y_end) {
+        for (int yi = y, idx = y * dim_x + x; yi < y_end; yi++, idx += dim_x)
+          occ[idx] += delta;
+      } else {
+        for (int yi = y, idx = y * dim_x + x; yi > y_end; yi--, idx -= dim_x)
+          occ[idx] += delta;
+      }
     }
   }
+  occ[py[num_pts - 1] * dim_x + px[num_pts - 1]] += delta;
 }
 
 inline int path_cost_direct(const int *occ, int dim_x, const Wire &wire) {
@@ -116,22 +123,138 @@ inline int path_cost_direct(const int *occ, int dim_x, const Wire &wire) {
   for (int seg = 0; seg < num_pts - 1; seg++) {
     int x = px[seg], y = py[seg];
     int x_end = px[seg + 1], y_end = py[seg + 1];
-    int dx = (x_end > x) ? 1 : (x_end < x) ? -1 : 0;
-    int dy = (y_end > y) ? 1 : (y_end < y) ? -1 : 0;
-    while (x != x_end || y != y_end) {
-      int v = occ[y * dim_x + x];
-      cost += v * v;
-      x += dx; y += dy;
+    if (y == y_end) {
+      const int *row = occ + y * dim_x;
+      if (x < x_end) {
+        for (int xi = x; xi < x_end; xi++) {
+          int v = row[xi];
+          cost += (v + 1) * (v + 1);
+        }
+      } else {
+        for (int xi = x; xi > x_end; xi--) {
+          int v = row[xi];
+          cost += (v + 1) * (v + 1);
+        }
+      }
+    } else {
+      if (y < y_end) {
+        for (int yi = y, idx = y * dim_x + x; yi < y_end; yi++, idx += dim_x) {
+          int v = occ[idx];
+          cost += (v + 1) * (v + 1);
+        }
+      } else {
+        for (int yi = y, idx = y * dim_x + x; yi > y_end; yi--, idx -= dim_x) {
+          int v = occ[idx];
+          cost += (v + 1) * (v + 1);
+        }
+      }
     }
-    if (seg == num_pts - 2) {
-      int v = occ[y * dim_x + x];
-      cost += v * v;
+  }
+  int v = occ[py[num_pts - 1] * dim_x + px[num_pts - 1]];
+  cost += (v + 1) * (v + 1);
+  return cost;
+}
+
+static inline int horizontal_seg_cost(
+    const int *__restrict__ occ, int dim_x, int y, int x_from, int x_to) {
+  int cost = 0;
+  const int *row = occ + y * dim_x;
+  if (x_from < x_to) {
+    for (int x = x_from; x < x_to; x++) {
+      int v = row[x];
+      cost += (v + 1) * (v + 1);
+    }
+  } else {
+    for (int x = x_from; x > x_to; x--) {
+      int v = row[x];
+      cost += (v + 1) * (v + 1);
     }
   }
   return cost;
 }
 
-Wire build_route(const Wire &wire, int route_index) {
+static inline int vertical_seg_cost(
+    const int *__restrict__ occ, int dim_x, int x, int y_from, int y_to) {
+  int cost = 0;
+  if (y_from < y_to) {
+    for (int y = y_from, idx = y_from * dim_x + x; y < y_to; y++, idx += dim_x) {
+      int v = occ[idx];
+      cost += (v + 1) * (v + 1);
+    }
+  } else {
+    for (int y = y_from, idx = y_from * dim_x + x; y > y_to; y--, idx -= dim_x) {
+      int v = occ[idx];
+      cost += (v + 1) * (v + 1);
+    }
+  }
+  return cost;
+}
+
+static inline int eval_route_cost(
+    const int *__restrict__ occ, int dim_x,
+    int sx, int sy, int ex, int ey,
+    int abs_dx, int abs_dy, int sign_x, int sign_y,
+    int min_x, int min_y,
+    int route_index) {
+
+  int cost = 0;
+
+  if (route_index < abs_dx) {
+    int a = route_index + 1;
+    int bx = sx + sign_x * a;
+    if (a == abs_dx) {
+      cost += horizontal_seg_cost(occ, dim_x, sy, sx, ex);
+      cost += vertical_seg_cost(occ, dim_x, ex, sy, ey);
+    } else {
+      cost += horizontal_seg_cost(occ, dim_x, sy, sx, bx);
+      cost += vertical_seg_cost(occ, dim_x, bx, sy, ey);
+      cost += horizontal_seg_cost(occ, dim_x, ey, bx, ex);
+    }
+  } else if (route_index < abs_dx + abs_dy) {
+    int b = route_index - abs_dx + 1;
+    int by = sy + sign_y * b;
+    if (b == abs_dy) {
+      cost += vertical_seg_cost(occ, dim_x, sx, sy, ey);
+      cost += horizontal_seg_cost(occ, dim_x, ey, sx, ex);
+    } else {
+      cost += vertical_seg_cost(occ, dim_x, sx, sy, by);
+      cost += horizontal_seg_cost(occ, dim_x, by, sx, ex);
+      cost += vertical_seg_cost(occ, dim_x, ex, by, ey);
+    }
+  } else {
+    int r_rel = route_index - abs_dx - abs_dy;
+    int interior_idx = r_rel / 2;
+    int orientation = r_rel % 2;
+    int interior_w = abs_dx - 1;
+    int xp = min_x + 1 + (interior_idx % interior_w);
+    int yp = min_y + 1 + (interior_idx / interior_w);
+    if (orientation == 0) {
+      cost += horizontal_seg_cost(occ, dim_x, sy, sx, xp);
+      cost += vertical_seg_cost(occ, dim_x, xp, sy, yp);
+      cost += horizontal_seg_cost(occ, dim_x, yp, xp, ex);
+      cost += vertical_seg_cost(occ, dim_x, ex, yp, ey);
+    } else {
+      cost += vertical_seg_cost(occ, dim_x, sx, sy, yp);
+      cost += horizontal_seg_cost(occ, dim_x, yp, sx, xp);
+      cost += vertical_seg_cost(occ, dim_x, xp, yp, ey);
+      cost += horizontal_seg_cost(occ, dim_x, ey, xp, ex);
+    }
+  }
+
+  int v = occ[ey * dim_x + ex];
+  cost += (v + 1) * (v + 1);
+  return cost;
+}
+
+struct PerfStats {
+  double t_occ = 0.0;
+  double t_eval = 0.0;
+  double t_search = 0.0;
+  long long occ_calls = 0;
+  long long route_evals = 0;
+};
+
+inline Wire build_route(const Wire &wire, int route_index) {
   int sx = wire.start_x, sy = wire.start_y;
   int ex = wire.end_x, ey = wire.end_y;
   int abs_dx = std::abs(ex - sx);
@@ -322,9 +445,10 @@ int main(int argc, char *argv[]) {
   int SA_iters = 5;
   char parallel_mode = '\0';
   int batch_size = 1;
+  bool profile_hotloops = false;
 
   int opt;
-  while ((opt = getopt(argc, argv, "f:n:p:i:m:b:")) != -1) {
+  while ((opt = getopt(argc, argv, "f:n:p:i:m:b:P")) != -1) {
     switch (opt) {
       case 'f':
         input_filename = optarg;
@@ -344,11 +468,14 @@ int main(int argc, char *argv[]) {
       case 'b':
         batch_size = atoi(optarg);
         break;
+      case 'P':
+        profile_hotloops = true;
+        break;
       default:
         if (rank == 0) {
           std::cerr << "Usage: " << argv[0]
                     << " -f input_filename -n num_procs [-p SA_prob] "
-                       "[-i SA_iters] -m parallel_mode -b batch_size\n";
+                       "[-i SA_iters] -m parallel_mode -b batch_size [-P]\n";
         }
         MPI_Finalize();
         exit(EXIT_FAILURE);
@@ -361,7 +488,7 @@ int main(int argc, char *argv[]) {
     if (rank == 0) {
       std::cerr << "Usage: " << argv[0]
                 << " -f input_filename -n num_procs [-p SA_prob] "
-                   "[-i SA_iters] -m parallel_mode -b batch_size\n";
+                   "[-i SA_iters] -m parallel_mode -b batch_size [-P]\n";
     }
     MPI_Finalize();
     exit(EXIT_FAILURE);
@@ -397,6 +524,7 @@ int main(int argc, char *argv[]) {
 
   int dim_x, dim_y, num_wires;
   std::vector<Wire> wires;
+  std::vector<int> work_order;
 
   {
     std::ifstream fin(input_filename);
@@ -408,6 +536,8 @@ int main(int argc, char *argv[]) {
     }
     fin >> dim_x >> dim_y >> num_wires;
     wires.resize(num_wires);
+    work_order.resize(num_wires);
+    std::iota(work_order.begin(), work_order.end(), 0);
     for (auto &wire : wires) {
       fin >> wire.start_x >> wire.start_y >> wire.end_x >> wire.end_y;
       if (wire.start_x == wire.end_x || wire.start_y == wire.end_y) {
@@ -418,6 +548,27 @@ int main(int argc, char *argv[]) {
         wire.bend_y[0] = wire.start_y;
       }
     }
+
+    std::stable_sort(
+        work_order.begin(), work_order.end(),
+        [&](int a, int b) {
+          const Wire &wa = wires[a];
+          const Wire &wb = wires[b];
+          int adx = std::abs(wa.end_x - wa.start_x);
+          int ady = std::abs(wa.end_y - wa.start_y);
+          int bdx = std::abs(wb.end_x - wb.start_x);
+          int bdy = std::abs(wb.end_y - wb.start_y);
+          long long ac = (adx == 0 || ady == 0)
+                             ? 0LL
+                             : (long long)adx + ady +
+                                   2LL * (adx - 1) * (ady - 1);
+          long long bc = (bdx == 0 || bdy == 0)
+                             ? 0LL
+                             : (long long)bdx + bdy +
+                                   2LL * (bdx - 1) * (bdy - 1);
+          if (ac != bc) return ac > bc;
+          return a < b;
+        });
   }
 
   std::vector<int> occupancy(dim_y * dim_x, 0);
@@ -439,6 +590,7 @@ int main(int argc, char *argv[]) {
 
   std::mt19937 rng(42 + rank);
   std::uniform_real_distribution<double> prob_dist(0.0, 1.0);
+  PerfStats perf;
 
   const int effective_batch = (nproc == 1) ? num_wires : batch_size;
   const int max_updates_per_peer = std::max(1, effective_batch);
@@ -461,69 +613,85 @@ int main(int argc, char *argv[]) {
       const int local_start = batch_idx * effective_batch;
       const int local_end = local_start + effective_batch;
       for (int local_i = local_start; local_i < local_end; local_i++) {
-        int wi = rank + local_i * nproc;
-        if (wi >= num_wires) break;
+        int work_slot = rank + local_i * nproc;
+        if (work_slot >= num_wires) break;
+        int wi = work_order[work_slot];
 
         Wire &wire = wires[wi];
         int abs_dx = std::abs(wire.end_x - wire.start_x);
         int abs_dy = std::abs(wire.end_y - wire.start_y);
         if (abs_dx == 0 || abs_dy == 0) continue;
 
-        int l_routes = abs_dx + abs_dy;
-        int u_routes = 2 * (abs_dx - 1) * (abs_dy - 1);
-        int total_routes = l_routes + u_routes;
+        int total_routes = abs_dx + abs_dy + 2 * (abs_dx - 1) * (abs_dy - 1);
 
         if (prob_dist(rng) < SA_prob) {
           std::uniform_int_distribution<int> route_dist(0, total_routes - 1);
           Wire new_wire = build_route(wire, route_dist(rng));
+          auto occ_t0 = std::chrono::steady_clock::now();
           update_occupancy(occ, dim_x, wire, -1);
           wire = new_wire;
           update_occupancy(occ, dim_x, wire, +1);
+          if (profile_hotloops) {
+            perf.t_occ += std::chrono::duration_cast<std::chrono::duration<double>>(
+                              std::chrono::steady_clock::now() - occ_t0)
+                              .count();
+            perf.occ_calls += 2;
+          }
           my_updates.push_back(wire_to_update(wi, wire));
           continue;
         }
 
+        int sx = wire.start_x, sy = wire.start_y;
+        int ex_ = wire.end_x, ey_ = wire.end_y;
+        int sign_x = (ex_ > sx) ? 1 : -1;
+        int sign_y = (ey_ > sy) ? 1 : -1;
+        int min_x = std::min(sx, ex_);
+        int min_y = std::min(sy, ey_);
+
+        auto occ_t0 = std::chrono::steady_clock::now();
         update_occupancy(occ, dim_x, wire, -1);
+        if (profile_hotloops) {
+          perf.t_occ += std::chrono::duration_cast<std::chrono::duration<double>>(
+                            std::chrono::steady_clock::now() - occ_t0)
+                            .count();
+          perf.occ_calls++;
+        }
+        auto search_t0 = std::chrono::steady_clock::now();
         int best_cost = path_cost_direct(occ, dim_x, wire);
+        auto eval_t0 = std::chrono::steady_clock::now();
         int best_idx = -1;
 
-        for (int r = 0; r < l_routes; r++) {
-          Wire candidate = build_route(wire, r);
-          int cost = path_cost_direct(occ, dim_x, candidate);
-          if (cost < best_cost) {
-            best_cost = cost;
+        for (int r = 0; r < total_routes; r++) {
+          int c = eval_route_cost(occ, dim_x, sx, sy, ex_, ey_,
+                                  abs_dx, abs_dy, sign_x, sign_y,
+                                  min_x, min_y, r);
+          if (c < best_cost) {
+            best_cost = c;
             best_idx = r;
           }
         }
-
-        if (u_routes <= MAX_U_SAMPLES) {
-          for (int r = l_routes; r < total_routes; r++) {
-            Wire candidate = build_route(wire, r);
-            int cost = path_cost_direct(occ, dim_x, candidate);
-            if (cost < best_cost) {
-              best_cost = cost;
-              best_idx = r;
-            }
-          }
-        } else {
-          std::uniform_int_distribution<int> u_dist(l_routes,
-                                                    total_routes - 1);
-          for (int s = 0; s < MAX_U_SAMPLES; s++) {
-            int r = u_dist(rng);
-            Wire candidate = build_route(wire, r);
-            int cost = path_cost_direct(occ, dim_x, candidate);
-            if (cost < best_cost) {
-              best_cost = cost;
-              best_idx = r;
-            }
-          }
+        if (profile_hotloops) {
+          perf.t_eval += std::chrono::duration_cast<std::chrono::duration<double>>(
+                             std::chrono::steady_clock::now() - eval_t0)
+                             .count();
+          perf.route_evals += total_routes;
+          perf.t_search += std::chrono::duration_cast<std::chrono::duration<double>>(
+                               std::chrono::steady_clock::now() - search_t0)
+                               .count();
         }
 
         if (best_idx >= 0) {
           wire = build_route(wire, best_idx);
           my_updates.push_back(wire_to_update(wi, wire));
         }
+        occ_t0 = std::chrono::steady_clock::now();
         update_occupancy(occ, dim_x, wire, +1);
+        if (profile_hotloops) {
+          perf.t_occ += std::chrono::duration_cast<std::chrono::duration<double>>(
+                            std::chrono::steady_clock::now() - occ_t0)
+                            .count();
+          perf.occ_calls++;
+        }
       }
 
       if (nproc > 1) {
@@ -543,6 +711,32 @@ int main(int argc, char *argv[]) {
             .count();
     std::cout << "Computation time (sec): " << std::fixed
               << std::setprecision(10) << compute_time << '\n';
+  }
+
+  if (profile_hotloops) {
+    double local_times[3] = {perf.t_occ, perf.t_eval, perf.t_search};
+    double global_times[3] = {0.0, 0.0, 0.0};
+    long long local_counts[2] = {perf.occ_calls, perf.route_evals};
+    long long global_counts[2] = {0, 0};
+
+    MPI_Reduce(local_times, global_times, 3, MPI_DOUBLE, MPI_SUM, 0,
+               MPI_COMM_WORLD);
+    MPI_Reduce(local_counts, global_counts, 2, MPI_LONG_LONG, MPI_SUM, 0,
+               MPI_COMM_WORLD);
+
+    if (rank == 0) {
+      double avg_occ = global_times[0] / nproc;
+      double avg_eval = global_times[1] / nproc;
+      double avg_search = global_times[2] / nproc;
+      std::cout << "Profile avg occupancy time (sec): " << std::fixed
+                << std::setprecision(10) << avg_occ << '\n';
+      std::cout << "Profile avg route-eval time (sec): " << std::fixed
+                << std::setprecision(10) << avg_eval << '\n';
+      std::cout << "Profile avg search time (sec): " << std::fixed
+                << std::setprecision(10) << avg_search << '\n';
+      std::cout << "Profile occupancy calls (sum): " << global_counts[0] << '\n';
+      std::cout << "Profile route evals (sum): " << global_counts[1] << '\n';
+    }
   }
 
   if (rank == 0) {
