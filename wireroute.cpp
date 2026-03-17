@@ -287,59 +287,96 @@ Wire update_to_wire(const RouteUpdate &u) {
   return w;
 }
 
-// --- Peer-to-peer exchange: send my updates to all others, receive from all, apply ---
-// Pack: [int count][RouteUpdate data]. One contiguous send/recv per peer.
+void apply_route_updates(std::vector<std::vector<int>> &occupancy,
+                         std::vector<Wire> &wires,
+                         const std::vector<RouteUpdate> &updates) {
+  for (const RouteUpdate &u : updates) {
+    int wi = u.wire_id;
+    if (wi < 0 || wi >= static_cast<int>(wires.size())) continue;
+    Wire old_wire = wires[wi];
+    update_occupancy(occupancy, old_wire, -1);
+    wires[wi] = update_to_wire(u);
+    update_occupancy(occupancy, wires[wi], +1);
+  }
+}
+
+// --- Ring exchange: forward one bucket per shift (P-1 shifts), no accumulation ---
+// Pack: [int origin_rank][int count][RouteUpdate data]
 void exchange_updates(std::vector<std::vector<int>> &occupancy,
                       std::vector<Wire> &wires,
                       const std::vector<RouteUpdate> &my_updates,
-                      int dim_x, int dim_y, int rank, int nproc,
-                      std::vector<std::vector<char>> &recv_bufs) {
-
-  const int tag = 0;
+                      int dim_x, int dim_y, int rank, int nproc, int tag,
+                      std::vector<char> &send_buf,
+                      std::vector<char> &recv_buf) {
   const int max_count = dim_x * dim_y * 2;
-  const int max_bytes = static_cast<int>(sizeof(int)) + max_count * static_cast<int>(sizeof(RouteUpdate));
+  const int max_bytes = static_cast<int>(2 * sizeof(int)) +
+                        max_count * static_cast<int>(sizeof(RouteUpdate));
 
-  std::vector<char> send_buf(max_bytes);
-  int count = static_cast<int>(my_updates.size());
-  std::memcpy(send_buf.data(), &count, sizeof(int));
-  if (count > 0) {
-    std::memcpy(send_buf.data() + sizeof(int), my_updates.data(), count * sizeof(RouteUpdate));
-  }
-  int send_size = static_cast<int>(sizeof(int)) + count * static_cast<int>(sizeof(RouteUpdate));
-
-  std::vector<MPI_Request> reqs;
-  reqs.reserve(2 * (nproc - 1));
-
-  for (int p = 0; p < nproc; p++) {
-    if (p == rank) continue;
-    MPI_Request r;
-    MPI_Isend(send_buf.data(), send_size, MPI_BYTE, p, tag, MPI_COMM_WORLD, &r);
-    reqs.push_back(r);
-  }
-
-  for (int p = 0; p < nproc; p++) {
-    if (p == rank) continue;
-    MPI_Request r;
-    MPI_Irecv(recv_bufs[p].data(), max_bytes, MPI_BYTE, p, tag, MPI_COMM_WORLD, &r);
-    reqs.push_back(r);
-  }
-
-  MPI_Waitall(static_cast<int>(reqs.size()), reqs.data(), MPI_STATUSES_IGNORE);
-
-  for (int p = 0; p < nproc; p++) {
-    if (p == rank) continue;
-    int n;
-    std::memcpy(&n, recv_bufs[p].data(), sizeof(int));
-    const RouteUpdate *updates = reinterpret_cast<const RouteUpdate *>(recv_bufs[p].data() + sizeof(int));
-    for (int k = 0; k < n; k++) {
-      const RouteUpdate &u = updates[k];
-      int wi = u.wire_id;
-      if (wi < 0 || wi >= static_cast<int>(wires.size())) continue;
-      Wire old_wire = wires[wi];
-      update_occupancy(occupancy, old_wire, -1);
-      wires[wi] = update_to_wire(u);
-      update_occupancy(occupancy, wires[wi], +1);
+  auto pack_bucket = [&](int origin_rank, const std::vector<RouteUpdate> &updates)
+                         -> int {
+    int count = static_cast<int>(updates.size());
+    if (count > max_count) {
+      std::cerr << "Rank " << rank << ": too many route updates in one bucket ("
+                << count << " > " << max_count << ")\n";
+      MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
     }
+    std::memcpy(send_buf.data(), &origin_rank, sizeof(int));
+    std::memcpy(send_buf.data() + sizeof(int), &count, sizeof(int));
+    if (count > 0) {
+      std::memcpy(send_buf.data() + 2 * sizeof(int), updates.data(),
+                  count * sizeof(RouteUpdate));
+    }
+    return static_cast<int>(2 * sizeof(int)) +
+           count * static_cast<int>(sizeof(RouteUpdate));
+  };
+
+  auto unpack_bucket = [&](std::vector<RouteUpdate> &updates, int &origin_rank) {
+    int count = 0;
+    std::memcpy(&origin_rank, recv_buf.data(), sizeof(int));
+    std::memcpy(&count, recv_buf.data() + sizeof(int), sizeof(int));
+    if (count < 0 || count > max_count) {
+      std::cerr << "Rank " << rank << ": invalid received update count " << count
+                << '\n';
+      MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+    }
+    updates.resize(count);
+    if (count > 0) {
+      std::memcpy(updates.data(), recv_buf.data() + 2 * sizeof(int),
+                  count * sizeof(RouteUpdate));
+    }
+  };
+
+  const int prev = (rank - 1 + nproc) % nproc;
+  const int next = (rank + 1) % nproc;
+
+  std::vector<RouteUpdate> curr_updates = my_updates;
+  std::vector<RouteUpdate> next_updates;
+  int curr_origin = rank;
+  int next_origin = -1;
+
+  for (int shift = 0; shift < nproc - 1; shift++) {
+    int send_size = pack_bucket(curr_origin, curr_updates);
+
+    MPI_Request reqs[2];
+    MPI_Irecv(recv_buf.data(), max_bytes, MPI_BYTE, prev, tag, MPI_COMM_WORLD,
+              &reqs[0]);
+    MPI_Isend(send_buf.data(), send_size, MPI_BYTE, next, tag, MPI_COMM_WORLD,
+              &reqs[1]);
+
+    // Apply remote bucket while this shift's communication is in flight.
+    if (curr_origin != rank) {
+      apply_route_updates(occupancy, wires, curr_updates);
+    }
+
+    MPI_Waitall(2, reqs, MPI_STATUSES_IGNORE);
+    unpack_bucket(next_updates, next_origin);
+
+    curr_updates.swap(next_updates);
+    curr_origin = next_origin;
+  }
+
+  if (curr_origin != rank) {
+    apply_route_updates(occupancy, wires, curr_updates);
   }
 }
 
@@ -468,19 +505,23 @@ int main(int argc, char *argv[]) {
   std::uniform_real_distribution<double> prob_dist(0.0, 1.0);
 
   const int max_updates_per_peer = dim_x * dim_y * 2;
-  const size_t max_exchange_bytes = sizeof(int) + max_updates_per_peer * sizeof(RouteUpdate);
-  std::vector<std::vector<char>> recv_bufs(nproc);
-  for (int p = 0; p < nproc; p++) {
-    recv_bufs[p].resize(max_exchange_bytes);
-  }
+  const size_t max_exchange_bytes =
+      2 * sizeof(int) + max_updates_per_peer * sizeof(RouteUpdate);
+  std::vector<char> ring_send_buf(max_exchange_bytes);
+  std::vector<char> ring_recv_buf(max_exchange_bytes);
+  // batch_size is interpreted as per-rank work per batch step.
+  const int num_batches =
+      (num_wires + (batch_size * nproc) - 1) / (batch_size * nproc);
 
   for (int iter = 0; iter < SA_iters; iter++) {
-    for (int batch_start = 0; batch_start < num_wires; batch_start += batch_size) {
-      int batch_end = std::min(batch_start + batch_size, num_wires);
+    for (int batch_idx = 0; batch_idx < num_batches; batch_idx++) {
       std::vector<RouteUpdate> my_updates;
 
-      for (int wi = batch_start; wi < batch_end; wi++) {
-        if (wi % nproc != rank) continue;
+      const int local_start = batch_idx * batch_size;
+      const int local_end = local_start + batch_size;
+      for (int local_i = local_start; local_i < local_end; local_i++) {
+        int wi = rank + local_i * nproc;
+        if (wi >= num_wires) break;
 
         Wire &wire = wires[wi];
         int abs_dx = std::abs(wire.end_x - wire.start_x);
@@ -522,8 +563,9 @@ int main(int argc, char *argv[]) {
         }
       }
 
+      const int tag = (iter * num_batches + batch_idx) % 32768;
       exchange_updates(occupancy, wires, my_updates, dim_x, dim_y, rank, nproc,
-                       recv_bufs);
+                       tag, ring_send_buf, ring_recv_buf);
     }
   }
 

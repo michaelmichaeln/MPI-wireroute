@@ -3,3 +3,4 @@
 !wireroute.cpp
 !wireroute.h
 !.gitignore
+!.run_wires.sh
