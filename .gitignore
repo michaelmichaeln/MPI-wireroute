@@ -3,6 +3,7 @@
 !wireroute.cpp
 !wireroute.h
 !README.md
+!DEVNOTES.md
 !.gitignore
 !.run_wires.sh
 !.run_wires_bench.sh
