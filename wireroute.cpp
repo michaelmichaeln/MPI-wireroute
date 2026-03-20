@@ -32,6 +32,11 @@ void print_stats(const int *occ, int n) {
   std::cout << "Total cost: " << total_cost << '\n';
 }
 
+/* This function writes the output into 2 files
+(1) It writes occupancy grids into a file
+(2) It converts wires from Wire to validate_wire_t by to_validate_format
+(3) It writes wires into another file
+*/
 void write_output(
     const std::vector<Wire> &wires, const int num_wires,
     const int *occ, const int dim_x, const int dim_y,
@@ -63,6 +68,7 @@ void write_output(
   out_wires << num_wires << '\n';
 
   for (const auto &wire : wires) {
+    // NOTICE: convert to keypoint representation for checker/output format
     validate_wire_t keypoints = wire.to_validate_format();
     for (int i = 0; i < keypoints.num_pts; ++i) {
       out_wires << keypoints.p[i].x << ' ' << keypoints.p[i].y;
@@ -344,7 +350,7 @@ Wire update_to_wire(const RouteUpdate &u) {
   }
   return w;
 }
-
+// add new path to occupancy grid
 void apply_route_updates(int *occ, int dim_x,
                          std::vector<Wire> &wires,
                          const std::vector<RouteUpdate> &updates) {
@@ -357,24 +363,25 @@ void apply_route_updates(int *occ, int dim_x,
   }
 }
 
+// exchange updates with previous process
 void exchange_updates(int *occ, int dim_x,
                       std::vector<Wire> &wires,
                       const std::vector<RouteUpdate> &my_updates,
-                      int max_count, int rank, int nproc, int tag,
+                      int max_count, int pid, int nproc, int tag,
                       std::vector<char> &send_buf,
                       std::vector<char> &recv_buf) {
   const int max_bytes = static_cast<int>(2 * sizeof(int)) +
                         max_count * static_cast<int>(sizeof(RouteUpdate));
 
-  auto pack_bucket = [&](int origin_rank,
+  auto pack_bucket = [&](int origin_pid, //pack into [origin_pid, count, payload]
                          const std::vector<RouteUpdate> &updates) -> int {
     int count = static_cast<int>(updates.size());
     if (count > max_count) {
-      std::cerr << "Rank " << rank << ": too many route updates ("
+      std::cerr << "pid " << pid << ": too many route updates ("
                 << count << " > " << max_count << ")\n";
       MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
     }
-    std::memcpy(send_buf.data(), &origin_rank, sizeof(int));
+    std::memcpy(send_buf.data(), &origin_pid, sizeof(int));
     std::memcpy(send_buf.data() + sizeof(int), &count, sizeof(int));
     if (count > 0)
       std::memcpy(send_buf.data() + 2 * sizeof(int), updates.data(),
@@ -384,12 +391,12 @@ void exchange_updates(int *occ, int dim_x,
   };
 
   auto unpack_bucket = [&](std::vector<RouteUpdate> &updates,
-                           int &origin_rank) {
+                           int &origin_pid) {
     int count = 0;
-    std::memcpy(&origin_rank, recv_buf.data(), sizeof(int));
+    std::memcpy(&origin_pid, recv_buf.data(), sizeof(int));
     std::memcpy(&count, recv_buf.data() + sizeof(int), sizeof(int));
     if (count < 0 || count > max_count) {
-      std::cerr << "Rank " << rank << ": invalid received count " << count
+      std::cerr << "pid " << pid << ": invalid received count " << count
                 << '\n';
       MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
     }
@@ -399,15 +406,15 @@ void exchange_updates(int *occ, int dim_x,
                   count * sizeof(RouteUpdate));
   };
 
-  const int prev = (rank - 1 + nproc) % nproc;
-  const int next = (rank + 1) % nproc;
+  const int prev = (pid - 1 + nproc) % nproc;
+  const int next = (pid + 1) % nproc;
 
   std::vector<RouteUpdate> curr_updates = my_updates;
   std::vector<RouteUpdate> next_updates;
-  int curr_origin = rank;
+  int curr_origin = pid;
   int next_origin = -1;
 
-  for (int shift = 0; shift < nproc - 1; shift++) {
+  for (int shift = 0; shift < nproc - 1; shift++) { // forwarding buckets p-1 times
     int send_size = pack_bucket(curr_origin, curr_updates);
 
     MPI_Request reqs[2];
@@ -416,7 +423,7 @@ void exchange_updates(int *occ, int dim_x,
     MPI_Isend(send_buf.data(), send_size, MPI_BYTE, next, tag,
               MPI_COMM_WORLD, &reqs[1]);
 
-    if (curr_origin != rank)
+    if (curr_origin != pid)
       apply_route_updates(occ, dim_x, wires, curr_updates);
 
     MPI_Waitall(2, reqs, MPI_STATUSES_IGNORE);
@@ -426,27 +433,32 @@ void exchange_updates(int *occ, int dim_x,
     curr_origin = next_origin;
   }
 
-  if (curr_origin != rank)
+  if (curr_origin != pid) //already applied to self
     apply_route_updates(occ, dim_x, wires, curr_updates);
 }
 
 int main(int argc, char *argv[]) {
   const auto init_start = std::chrono::steady_clock::now();
-  int rank = 0;
+  int pid = 0;
   int nproc = 0;
 
+  // Initialize MPI
   MPI_Init(&argc, &argv);
-  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  // Get process rank
+  MPI_Comm_rank(MPI_COMM_WORLD, &pid);
+  // Get total number of processes 
   MPI_Comm_size(MPI_COMM_WORLD, &nproc);
 
   std::string input_filename;
-  int n_flag = 0;
+
   double SA_prob = 0.1;
   int SA_iters = 5;
-  char parallel_mode = '\0';
   int batch_size = 1;
+  char parallel_mode = '\0';
   bool profile_hotloops = false;
+  int n_flag = 0;
 
+  // Read command line arguments
   int opt;
   while ((opt = getopt(argc, argv, "f:n:p:i:m:b:P")) != -1) {
     switch (opt) {
@@ -472,7 +484,7 @@ int main(int argc, char *argv[]) {
         profile_hotloops = true;
         break;
       default:
-        if (rank == 0) {
+        if (pid == 0) {
           std::cerr << "Usage: " << argv[0]
                     << " -f input_filename -n num_procs [-p SA_prob] "
                        "[-i SA_iters] -m parallel_mode -b batch_size [-P]\n";
@@ -482,10 +494,11 @@ int main(int argc, char *argv[]) {
     }
   }
 
+  // Check if required options are provided
   if (input_filename.empty() || n_flag <= 0 || SA_iters <= 0 ||
       batch_size <= 0 ||
       (parallel_mode != 'A' && parallel_mode != 'W')) {
-    if (rank == 0) {
+    if (pid == 0) {
       std::cerr << "Usage: " << argv[0]
                 << " -f input_filename -n num_procs [-p SA_prob] "
                    "[-i SA_iters] -m parallel_mode -b batch_size [-P]\n";
@@ -495,7 +508,7 @@ int main(int argc, char *argv[]) {
   }
 
   if (n_flag != nproc) {
-    if (rank == 0) {
+    if (pid == 0) {
       std::cerr << "Error: -n " << n_flag
                 << " must match number of MPI processes " << nproc << "\n";
     }
@@ -504,7 +517,7 @@ int main(int argc, char *argv[]) {
   }
 
   if (parallel_mode != 'A') {
-    if (rank == 0) {
+    if (pid == 0) {
       std::cerr << "This implementation supports only "
                    "across-wires mode (-m A).\n";
     }
@@ -512,7 +525,7 @@ int main(int argc, char *argv[]) {
     exit(EXIT_FAILURE);
   }
 
-  if (rank == 0) {
+  if (pid == 0) {
     std::cout << "Number of processes: " << nproc << '\n';
     std::cout << "Simulated annealing probability parameter: " << SA_prob
               << '\n';
@@ -527,9 +540,10 @@ int main(int argc, char *argv[]) {
   std::vector<int> work_order;
 
   {
+    /* Read the grid dimension and wire information from file */
     std::ifstream fin(input_filename);
     if (!fin) {
-      std::cerr << "Rank " << rank << ": unable to open " << input_filename
+      std::cerr << "pid " << pid << ": unable to open " << input_filename
                 << '\n';
       MPI_Finalize();
       exit(EXIT_FAILURE);
@@ -548,7 +562,7 @@ int main(int argc, char *argv[]) {
         wire.bend_y[0] = wire.start_y;
       }
     }
-
+// estimate work of wires for load balancing
     std::stable_sort(
         work_order.begin(), work_order.end(),
         [&](int a, int b) {
@@ -577,7 +591,7 @@ int main(int argc, char *argv[]) {
   for (const auto &wire : wires)
     update_occupancy(occ, dim_x, wire, +1);
 
-  if (rank == 0) {
+  if (pid == 0) {
     const double init_time =
         std::chrono::duration_cast<std::chrono::duration<double>>(
             std::chrono::steady_clock::now() - init_start)
@@ -588,10 +602,11 @@ int main(int argc, char *argv[]) {
 
   const auto compute_start = std::chrono::steady_clock::now();
 
-  std::mt19937 rng(42 + rank);
+  std::mt19937 rng(42 + pid);
   std::uniform_real_distribution<double> prob_dist(0.0, 1.0);
   PerfStats perf;
 
+  // sync vs stale
   const int effective_batch = (nproc == 1) ? num_wires : batch_size;
   const int max_updates_per_peer = std::max(1, effective_batch);
   const size_t max_exchange_bytes =
@@ -613,7 +628,8 @@ int main(int argc, char *argv[]) {
       const int local_start = batch_idx * effective_batch;
       const int local_end = local_start + effective_batch;
       for (int local_i = local_start; local_i < local_end; local_i++) {
-        int work_slot = rank + local_i * nproc;
+        // interleaved
+        int work_slot = pid + local_i * nproc;
         if (work_slot >= num_wires) break;
         int wi = work_order[work_slot];
 
@@ -627,8 +643,8 @@ int main(int argc, char *argv[]) {
         if (prob_dist(rng) < SA_prob) {
           std::uniform_int_distribution<int> route_dist(0, total_routes - 1);
           Wire new_wire = build_route(wire, route_dist(rng));
-          auto occ_t0 = std::chrono::steady_clock::now();
-          update_occupancy(occ, dim_x, wire, -1);
+          auto occ_t0 = std::chrono::steady_clock::now(); 
+          update_occupancy(occ, dim_x, wire, -1); // remove old path
           wire = new_wire;
           update_occupancy(occ, dim_x, wire, +1);
           if (profile_hotloops) {
@@ -697,14 +713,15 @@ int main(int argc, char *argv[]) {
       if (nproc > 1) {
         const int tag = (iter * num_batches + batch_idx) % 32768;
         exchange_updates(occ, dim_x, wires, my_updates, max_updates_per_peer,
-                         rank, nproc, tag, ring_send_buf, ring_recv_buf);
+                         pid, nproc, tag, ring_send_buf, ring_recv_buf);
       }
     }
   }
-
+  // aligning all processes
   MPI_Barrier(MPI_COMM_WORLD);
 
-  if (rank == 0) {
+  if (pid == 0) {
+    // compute time
     const double compute_time =
         std::chrono::duration_cast<std::chrono::duration<double>>(
             std::chrono::steady_clock::now() - compute_start)
@@ -718,13 +735,13 @@ int main(int argc, char *argv[]) {
     double global_times[3] = {0.0, 0.0, 0.0};
     long long local_counts[2] = {perf.occ_calls, perf.route_evals};
     long long global_counts[2] = {0, 0};
-
+    // reduce times and counts across all processes
     MPI_Reduce(local_times, global_times, 3, MPI_DOUBLE, MPI_SUM, 0,
                MPI_COMM_WORLD);
     MPI_Reduce(local_counts, global_counts, 2, MPI_LONG_LONG, MPI_SUM, 0,
                MPI_COMM_WORLD);
 
-    if (rank == 0) {
+    if (pid == 0) {
       double avg_occ = global_times[0] / nproc;
       double avg_eval = global_times[1] / nproc;
       double avg_search = global_times[2] / nproc;
@@ -739,7 +756,8 @@ int main(int argc, char *argv[]) {
     }
   }
 
-  if (rank == 0) {
+  if (pid == 0) {
+    /* Write wires and occupancy matrix to files */
     std::vector<std::vector<int>> occ_2d(dim_y, std::vector<int>(dim_x));
     for (int y = 0; y < dim_y; y++)
       for (int x = 0; x < dim_x; x++)
@@ -752,6 +770,7 @@ int main(int argc, char *argv[]) {
                  "outputs/wire_output.txt", "outputs/occ_output.txt");
   }
 
+  // Cleanup
   MPI_Finalize();
   return 0;
 }
