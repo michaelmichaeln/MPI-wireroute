@@ -91,7 +91,7 @@ mpirun -np <numprocs> ./wireroute -f <input_file> -b <batch_size> [-p <SA_prob>]
 
 ```bash
 # 4 threads, 10 SA iterations
-mpirun -np 4 ./wireroute -f inputs/debug/sample_8_8wires.txt -i 10
+mpirun -np 1 ./wireroute -f inputs/timeinput/medium_wires.txt -i 10 -b 4 -i 5 -p 0.1
 
 # 8 threads, batch size 4
 mpirun -np 8 ./wireroute -f inputs/debug/sample_8_8wires.txt -b 4 -i 5 -p 0.1
